@@ -75,11 +75,8 @@ AGENT_CARD = {
     "defaultInputModes": ["text/plain"],
     "defaultOutputModes": ["text/plain"],
     "authentication": {
-        "ApiKeyAuth": {
-            "type": "apiKey",
-            "in": "header",
-            "name": "X-API-Key",
-        }
+        "schemes": ["apiKey"],
+        "credentials": "Provide your API key in the X-API-Key request header.",
     },
     "skills": [
         {
