@@ -78,6 +78,14 @@ AGENT_CARD = {
         "schemes": ["apiKey"],
         "credentials": "Provide your API key in the X-API-Key request header.",
     },
+    "securitySchemes": {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+        }
+    },
+    "security": [{"ApiKeyAuth": []}],
     "skills": [
         {
             "id": "bike-recommendation",
