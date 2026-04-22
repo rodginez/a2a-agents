@@ -1,14 +1,15 @@
 """
-A2A server for the Bike Part Upgrade Agent.
+A2A server for the Bike Part Upgrade Agent — v0.3.0 compliant.
 
-Implements the Google A2A protocol:
-  - GET  /.well-known/agent.json  →  Agent Card
-  - POST /                        →  JSON-RPC 2.0 task endpoint
+Endpoints:
+  GET  /.well-known/agent-card.json  →  Agent Card (0.3.0)
+  GET  /.well-known/agent.json       →  Agent Card (legacy alias)
+  GET  /ping                         →  Health check
+  POST /                             →  JSON-RPC 2.0 task endpoint
 
 Supported methods:
   message/send    — send a user message and get a reply (non-streaming)
   message/stream  — send a user message and stream the reply via SSE
-  tasks/send      — alias for message/send (backward compat)
   tasks/get       — retrieve an existing task by ID
   tasks/cancel    — cancel a pending/working task
 
@@ -51,12 +52,13 @@ _sessions: dict[str, list[dict]] = {}
 _tasks: dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
-# Agent Card
+# Agent Card (A2A 0.3.0)
 # ---------------------------------------------------------------------------
 
 AGENT_URL = os.getenv("AGENT_URL", "http://localhost:8080")
 
 AGENT_CARD = {
+    "protocolVersion": "0.3.0",
     "name": "Bike Part Upgrade Agent",
     "description": (
         "A conversational AI agent that helps cyclists choose the best component "
@@ -70,16 +72,15 @@ AGENT_CARD = {
         "pushNotifications": False,
         "stateTransitionHistory": False,
     },
-    "defaultInputModes": ["text"],
-    "defaultOutputModes": ["text"],
-    "securitySchemes": {
+    "defaultInputModes": ["text/plain"],
+    "defaultOutputModes": ["text/plain"],
+    "authentication": {
         "ApiKeyAuth": {
             "type": "apiKey",
             "in": "header",
             "name": "X-API-Key",
         }
     },
-    "security": [{"ApiKeyAuth": []}],
     "skills": [
         {
             "id": "bike-part-upgrade",
@@ -102,9 +103,19 @@ AGENT_CARD = {
 }
 
 
-@app.get("/.well-known/agent.json")
+@app.get("/.well-known/agent-card.json")
 async def agent_card() -> dict:
     return AGENT_CARD
+
+
+@app.get("/.well-known/agent.json")
+async def agent_card_legacy() -> dict:
+    return AGENT_CARD
+
+
+@app.get("/ping")
+async def ping() -> dict:
+    return {"status": "ok"}
 
 
 @app.get("/")
@@ -124,8 +135,8 @@ def _extract_text(parts: list[dict]) -> str:
     texts = []
     for p in parts:
         text = p.get("text", "")
-        part_type = p.get("type", "text")
-        if text and part_type == "text":
+        kind = p.get("kind") or p.get("type", "text")
+        if text and kind == "text":
             texts.append(text)
     return " ".join(texts).strip()
 
@@ -137,7 +148,9 @@ def _make_task(task_id: str, context_id: str, state: str) -> dict:
         messages.append({
             "messageId": str(uuid.uuid4()),
             "role": a2a_role,
-            "parts": [{"type": "text", "text": msg["content"]}],
+            "contextId": context_id,
+            "timestamp": _now(),
+            "parts": [{"kind": "text", "text": msg["content"]}],
         })
     return {
         "id": task_id,
@@ -187,7 +200,7 @@ async def jsonrpc_handler(request: Request):
     if body.get("jsonrpc") != "2.0":
         return JSONResponse(_rpc_error(rpc_id, -32600, "Invalid JSON-RPC version"))
 
-    if method in ("message/send", "tasks/send"):
+    if method == "message/send":
         return JSONResponse(await _handle_message_send(rpc_id, params))
     if method == "message/stream":
         return StreamingResponse(
@@ -208,9 +221,14 @@ async def jsonrpc_handler(request: Request):
 # ---------------------------------------------------------------------------
 
 async def _handle_message_send(rpc_id: Any, params: dict) -> dict:
-    task_id = params.get("id") or str(uuid.uuid4())
-    context_id = params.get("contextId") or params.get("sessionId") or str(uuid.uuid4())
-    user_text = _extract_text(params.get("message", {}).get("parts", []))
+    message = params.get("message", {})
+    task_id = str(uuid.uuid4())
+    context_id = (
+        message.get("contextId")
+        or params.get("contextId")
+        or str(uuid.uuid4())
+    )
+    user_text = _extract_text(message.get("parts", []))
 
     if not user_text:
         return _rpc_error(rpc_id, -32602, "Message must contain at least one text part")
@@ -235,13 +253,18 @@ async def _handle_message_send(rpc_id: Any, params: dict) -> dict:
     _sessions[context_id].append({"role": "assistant", "content": agent_reply})
     task = _make_task(task_id, context_id, "completed")
     _tasks[task_id] = task
-    return _rpc_result(rpc_id, task)
+    return _rpc_result(rpc_id, {"task": task})
 
 
 async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str]:
-    task_id = params.get("id") or str(uuid.uuid4())
-    context_id = params.get("contextId") or params.get("sessionId") or str(uuid.uuid4())
-    user_text = _extract_text(params.get("message", {}).get("parts", []))
+    message = params.get("message", {})
+    task_id = str(uuid.uuid4())
+    context_id = (
+        message.get("contextId")
+        or params.get("contextId")
+        or str(uuid.uuid4())
+    )
+    user_text = _extract_text(message.get("parts", []))
 
     if not user_text:
         yield _sse(_rpc_error(rpc_id, -32602, "Message must contain at least one text part"))
@@ -252,12 +275,14 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
     _sessions[context_id].append({"role": "user", "content": user_text})
 
     yield _sse(_rpc_result(rpc_id, {
-        "id": task_id,
+        "taskId": task_id,
         "contextId": context_id,
         "status": {"state": "working", "timestamp": _now()},
+        "final": False,
     }))
 
     collected = []
+    artifact_id = str(uuid.uuid4())
     try:
         async with _client.messages.stream(
             model="claude-opus-4-7",
@@ -268,10 +293,14 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
             async for text in stream.text_stream:
                 collected.append(text)
                 yield _sse(_rpc_result(rpc_id, {
-                    "id": task_id,
+                    "taskId": task_id,
                     "contextId": context_id,
-                    "status": {"state": "working", "timestamp": _now()},
-                    "delta": {"type": "text", "text": text},
+                    "artifact": {
+                        "artifactId": artifact_id,
+                        "parts": [{"kind": "text", "text": text}],
+                        "append": True,
+                        "lastChunk": False,
+                    },
                 }))
     except Exception as exc:
         yield _sse(_rpc_error(rpc_id, -32000, f"Agent error: {exc}"))
@@ -281,27 +310,33 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
     _sessions[context_id].append({"role": "assistant", "content": agent_reply})
     task = _make_task(task_id, context_id, "completed")
     _tasks[task_id] = task
-    yield _sse(_rpc_result(rpc_id, task))
+
+    yield _sse(_rpc_result(rpc_id, {
+        "taskId": task_id,
+        "contextId": context_id,
+        "status": {"state": "completed", "timestamp": _now()},
+        "final": True,
+    }))
 
 
 def _handle_tasks_get(rpc_id: Any, params: dict) -> dict:
-    task_id = params.get("id")
+    task_id = params.get("taskId") or params.get("id")
     if not task_id:
-        return _rpc_error(rpc_id, -32602, "Missing required param: id")
+        return _rpc_error(rpc_id, -32602, "Missing required param: taskId")
     task = _tasks.get(task_id)
     if task is None:
         return _rpc_error(rpc_id, -32001, f"Task not found: {task_id}")
-    return _rpc_result(rpc_id, task)
+    return _rpc_result(rpc_id, {"task": task})
 
 
 def _handle_tasks_cancel(rpc_id: Any, params: dict) -> dict:
-    task_id = params.get("id")
+    task_id = params.get("taskId") or params.get("id")
     if not task_id:
-        return _rpc_error(rpc_id, -32602, "Missing required param: id")
+        return _rpc_error(rpc_id, -32602, "Missing required param: taskId")
     task = _tasks.get(task_id)
     if task is None:
         return _rpc_error(rpc_id, -32001, f"Task not found: {task_id}")
     if task["status"]["state"] in ("completed", "failed", "canceled"):
         return _rpc_error(rpc_id, -32002, f"Task already in terminal state: {task['status']['state']}")
     task["status"] = {"state": "canceled", "timestamp": _now()}
-    return _rpc_result(rpc_id, task)
+    return _rpc_result(rpc_id, {"task": task})
