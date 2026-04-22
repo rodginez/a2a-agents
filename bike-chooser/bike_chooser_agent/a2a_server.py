@@ -152,9 +152,9 @@ def _make_task(task_id: str, context_id: str, state: str) -> dict:
             "parts": [{"kind": "text", "text": msg["content"]}],
         })
     return {
-        "taskId": task_id,
+        "id": task_id,
         "contextId": context_id,
-        "state": state,
+        "status": {"state": state, "timestamp": _now()},
         "messages": messages,
         "artifacts": [],
     }
@@ -273,15 +273,16 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
         _sessions[context_id] = []
     _sessions[context_id].append({"role": "user", "content": user_text})
 
+    # Initial working status — final=False, more events to come
     yield _sse(_rpc_result(rpc_id, {
-        "taskStatusUpdate": {
-            "taskId": task_id,
-            "contextId": context_id,
-            "state": "working",
-        }
+        "taskId": task_id,
+        "contextId": context_id,
+        "status": {"state": "working", "timestamp": _now()},
+        "final": False,
     }))
 
     collected = []
+    artifact_id = str(uuid.uuid4())
     try:
         async with _client.messages.stream(
             model="claude-opus-4-7",
@@ -292,15 +293,14 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
             async for text in stream.text_stream:
                 collected.append(text)
                 yield _sse(_rpc_result(rpc_id, {
-                    "taskArtifactUpdate": {
-                        "taskId": task_id,
-                        "contextId": context_id,
-                        "artifact": {
-                            "artifactId": str(uuid.uuid4()),
-                            "parts": [{"kind": "text", "text": text}],
-                            "append": True,
-                        },
-                    }
+                    "taskId": task_id,
+                    "contextId": context_id,
+                    "artifact": {
+                        "artifactId": artifact_id,
+                        "parts": [{"kind": "text", "text": text}],
+                        "append": True,
+                        "lastChunk": False,
+                    },
                 }))
     except Exception as exc:
         yield _sse(_rpc_error(rpc_id, -32000, f"Agent error: {exc}"))
@@ -311,12 +311,12 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
     task = _make_task(task_id, context_id, "completed")
     _tasks[task_id] = task
 
+    # Final completed status — final=True signals end of stream
     yield _sse(_rpc_result(rpc_id, {
-        "taskStatusUpdate": {
-            "taskId": task_id,
-            "contextId": context_id,
-            "state": "completed",
-        }
+        "taskId": task_id,
+        "contextId": context_id,
+        "status": {"state": "completed", "timestamp": _now()},
+        "final": True,
     }))
 
 
@@ -337,7 +337,7 @@ def _handle_tasks_cancel(rpc_id: Any, params: dict) -> dict:
     task = _tasks.get(task_id)
     if task is None:
         return _rpc_error(rpc_id, -32001, f"Task not found: {task_id}")
-    if task["state"] in ("completed", "failed", "canceled"):
-        return _rpc_error(rpc_id, -32002, f"Task already in terminal state: {task['state']}")
-    task["state"] = "canceled"
+    if task["status"]["state"] in ("completed", "failed", "canceled"):
+        return _rpc_error(rpc_id, -32002, f"Task already in terminal state: {task['status']['state']}")
+    task["status"] = {"state": "canceled", "timestamp": _now()}
     return _rpc_result(rpc_id, {"task": task})
