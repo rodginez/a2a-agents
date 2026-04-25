@@ -146,22 +146,24 @@ def _extract_text(parts: list[dict]) -> str:
     return " ".join(texts).strip()
 
 
-def _make_task(task_id: str, context_id: str, state: str) -> dict:
-    messages: list[dict] = []
-    for msg in _sessions.get(context_id, []):
-        a2a_role = "user" if msg["role"] == "user" else "agent"
-        messages.append({
+def _make_task(task_id: str, context_id: str, state: str, exchange: list[dict] | None = None) -> dict:
+    history = [
+        {
+            "kind": "message",
             "messageId": str(uuid.uuid4()),
-            "role": a2a_role,
+            "role": "user" if msg["role"] == "user" else "agent",
             "contextId": context_id,
             "timestamp": _now(),
             "parts": [{"kind": "text", "text": msg["content"]}],
-        })
+        }
+        for msg in (exchange or [])
+    ]
     return {
+        "kind": "task",
         "id": task_id,
         "contextId": context_id,
         "status": {"state": state, "timestamp": _now()},
-        "messages": messages,
+        "history": history,
         "artifacts": [],
     }
 
@@ -230,7 +232,7 @@ async def _handle_message_send(rpc_id: Any, params: dict) -> dict:
     task_id = str(uuid.uuid4())
     context_id = (
         message.get("contextId")
-        or params.get("contextId")
+        or params.get("config", {}).get("contextId")
         or str(uuid.uuid4())
     )
     user_text = _extract_text(message.get("parts", []))
@@ -252,13 +254,16 @@ async def _handle_message_send(rpc_id: Any, params: dict) -> dict:
         )
         agent_reply = next((b.text for b in response.content if b.type == "text"), "")
     except Exception as exc:
-        _tasks[task_id] = _make_task(task_id, context_id, "failed")
+        _tasks[task_id] = _make_task(task_id, context_id, "failed", [{"role": "user", "content": user_text}])
         return _rpc_error(rpc_id, -32000, f"Agent error: {exc}")
 
     _sessions[context_id].append({"role": "assistant", "content": agent_reply})
-    task = _make_task(task_id, context_id, "completed")
+    task = _make_task(task_id, context_id, "completed", [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": agent_reply},
+    ])
     _tasks[task_id] = task
-    return _rpc_result(rpc_id, {"task": task})
+    return _rpc_result(rpc_id, task)
 
 
 async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str]:
@@ -266,7 +271,7 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
     task_id = str(uuid.uuid4())
     context_id = (
         message.get("contextId")
-        or params.get("contextId")
+        or params.get("config", {}).get("contextId")
         or str(uuid.uuid4())
     )
     user_text = _extract_text(message.get("parts", []))
@@ -292,6 +297,7 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
         async with _client.messages.stream(
             model="claude-opus-4-7",
             max_tokens=1024,
+            thinking={"type": "adaptive"},
             system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
             messages=_sessions[context_id],
         ) as stream:
@@ -313,7 +319,10 @@ async def _handle_message_stream(rpc_id: Any, params: dict) -> AsyncIterator[str
 
     agent_reply = "".join(collected)
     _sessions[context_id].append({"role": "assistant", "content": agent_reply})
-    task = _make_task(task_id, context_id, "completed")
+    task = _make_task(task_id, context_id, "completed", [
+        {"role": "user", "content": user_text},
+        {"role": "assistant", "content": agent_reply},
+    ])
     _tasks[task_id] = task
 
     yield _sse(_rpc_result(rpc_id, {
@@ -331,7 +340,7 @@ def _handle_tasks_get(rpc_id: Any, params: dict) -> dict:
     task = _tasks.get(task_id)
     if task is None:
         return _rpc_error(rpc_id, -32001, f"Task not found: {task_id}")
-    return _rpc_result(rpc_id, {"task": task})
+    return _rpc_result(rpc_id, task)
 
 
 def _handle_tasks_cancel(rpc_id: Any, params: dict) -> dict:
@@ -344,4 +353,4 @@ def _handle_tasks_cancel(rpc_id: Any, params: dict) -> dict:
     if task["status"]["state"] in ("completed", "failed", "canceled"):
         return _rpc_error(rpc_id, -32002, f"Task already in terminal state: {task['status']['state']}")
     task["status"] = {"state": "canceled", "timestamp": _now()}
-    return _rpc_result(rpc_id, {"task": task})
+    return _rpc_result(rpc_id, task)
