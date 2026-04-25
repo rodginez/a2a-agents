@@ -1,6 +1,12 @@
 """
-Bike Part Upgrade Agent — system prompt.
+Bike Part Upgrade Agent — system prompt and agent class.
 """
+
+import os
+from collections.abc import AsyncGenerator
+from typing import Any
+
+import anthropic
 
 SYSTEM_PROMPT = """You are an expert bicycle mechanic and component specialist who helps cyclists choose the best part upgrades for their bike.
 
@@ -25,3 +31,23 @@ Guidelines:
 - Be honest about diminishing returns — sometimes a cheaper upgrade delivers more value
 - Flag when an upgrade requires additional parts (e.g. new chain when changing cassette)
 - If the user's budget is too low for a meaningful upgrade, say so and suggest saving up or a different upgrade path"""
+
+
+class BikeUpgradeAgent:
+    def __init__(self):
+        self.client = anthropic.AsyncAnthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+    async def stream(self, query: str) -> AsyncGenerator[dict[str, Any], None]:
+        try:
+            async with self.client.messages.stream(
+                model="claude-opus-4-7",
+                max_tokens=1024,
+                thinking={"type": "adaptive"},
+                system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+                messages=[{"role": "user", "content": query}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    yield {"content": text, "done": False}
+            yield {"content": "", "done": True}
+        except Exception as e:
+            yield {"content": f"Sorry, an error occurred: {e}", "done": True}
