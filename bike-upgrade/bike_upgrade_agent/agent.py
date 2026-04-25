@@ -40,7 +40,7 @@ class BikeUpgradeAgent:
     async def stream(self, query: str) -> AsyncGenerator[dict[str, Any], None]:
         try:
             async with self.client.messages.stream(
-                model="claude-opus-4-7",
+                model="claude-sonnet-4-6",
                 max_tokens=1024,
                 thinking={"type": "adaptive"},
                 system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
